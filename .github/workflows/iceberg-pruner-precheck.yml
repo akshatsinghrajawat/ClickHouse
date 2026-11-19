@@ -80,12 +80,14 @@ jobs:
           sudo apt-get install --no-install-recommends -y clang-format-20
           clang-format-20 --version
 
-      - name: Check formatting of changed C++ lines
+      - name: Generate changed-line clang-format suggestions
         run: |
           python - <<'PY'
+          import difflib
           import re
           import subprocess
           import sys
+          from pathlib import Path
 
           candidate = "origin/issue-131937-pruner-reuse"
           base = f"{candidate}^"
@@ -123,49 +125,68 @@ jobs:
                           )
 
           if not ranges:
-              sys.exit("No changed C++ lines found; refusing to pass an empty check.")
+              sys.exit("No changed C++ lines found.")
 
-          failed = False
+          suggestions = []
 
           for filename, intervals in ranges.items():
               merged = []
 
-              for start, end in sorted(intervals):
-                  if merged and start <= merged[-1][1] + 1:
-                      merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+              for first, last in sorted(intervals):
+                  if merged and first <= merged[-1][1] + 1:
+                      merged[-1] = (
+                          merged[-1][0],
+                          max(merged[-1][1], last),
+                      )
                   else:
-                      merged.append((start, end))
+                      merged.append((first, last))
 
               command = [
                   "clang-format-20",
-                  "--dry-run",
-                  "--Werror",
                   "--style=file",
                   "--fallback-style=none",
               ]
 
-              for start, end in merged:
-                  command.append(f"--lines={start}:{end}")
+              for first, last in merged:
+                  command.append(f"--lines={first}:{last}")
 
               command.append(filename)
 
-              print(f"Checking changed lines: {filename}")
+              original = Path(filename).read_text()
+              formatted = subprocess.run(
+                  command,
+                  check=True,
+                  capture_output=True,
+                  text=True,
+              ).stdout
 
-              result = subprocess.run(command, text=True, capture_output=True)
+              suggestions.extend(
+                  difflib.unified_diff(
+                      original.splitlines(keepends=True),
+                      formatted.splitlines(keepends=True),
+                      fromfile=f"a/{filename}",
+                      tofile=f"b/{filename}",
+                  )
+              )
 
-              if result.stdout:
-                  print(result.stdout)
-              if result.stderr:
-                  print(result.stderr, file=sys.stderr)
+          patch_path = Path("clang-format-suggestions.patch")
+          patch_path.write_text("".join(suggestions))
 
-              if result.returncode:
-                  failed = True
+          if suggestions:
+              print(f"Formatting suggestions written to {patch_path}.")
+              print("The patch will be uploaded as a workflow artifact.")
+              sys.exit(1)
 
-          if failed:
-              sys.exit("C++ changed-line formatting check failed.")
-
-          print("All changed C++ lines pass clang-format.")
+          print("All changed C++ regions pass clang-format-20.")
           PY
+
+      - name: Upload formatting suggestions
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: clang-format-suggestions
+          path: clang-format-suggestions.patch
+          if-no-files-found: warn
 
       - name: Set up Python 3.13
         uses: actions/setup-python@v5
