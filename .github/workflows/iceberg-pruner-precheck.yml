@@ -1,0 +1,215 @@
+name: Iceberg pruner pre-PR checks
+
+on:
+  push:
+    branches:
+      - ci-precheck
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  precheck:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout relevant ClickHouse files
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            /src/Storages/ObjectStorage/DataLakes/Iceberg/
+            /tests/integration/helpers/catalog_manager.py
+            /tests/integration/helpers/catalog_manager_iceberg_s3.py
+            /tests/integration/helpers/catalog_manager_iceberg_azure.py
+            /tests/integration/test_e2e_iceberg_engine/test.py
+
+      - name: Fetch contribution branch
+        run: |
+          git fetch --no-tags --depth=2 origin \
+            +refs/heads/issue-131937-pruner-reuse:refs/remotes/origin/issue-131937-pruner-reuse
+
+      - name: Check out contribution commit
+        run: |
+          git checkout --detach origin/issue-131937-pruner-reuse
+
+      - name: Validate contribution diff
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          candidate="origin/issue-131937-pruner-reuse"
+          base="$(git rev-parse "${candidate}^")"
+
+          expected="$(printf '%s\n' \
+            src/Storages/ObjectStorage/DataLakes/Iceberg/IcebergMetadata.cpp \
+            src/Storages/ObjectStorage/DataLakes/Iceberg/ManifestFileIterator.cpp \
+            src/Storages/ObjectStorage/DataLakes/Iceberg/ManifestFileIterator.h \
+            tests/integration/helpers/catalog_manager_iceberg_azure.py \
+            tests/integration/helpers/catalog_manager_iceberg_s3.py \
+            tests/integration/test_e2e_iceberg_engine/test.py | LC_ALL=C sort)"
+
+          actual="$(git diff --name-only "$base" "$candidate" | LC_ALL=C sort)"
+
+          if [[ "$actual" != "$expected" ]]; then
+            echo "Unexpected contribution file set."
+            echo "Expected:"
+            printf '%s\n' "$expected"
+            echo "Actual:"
+            printf '%s\n' "$actual"
+            exit 1
+          fi
+
+          git diff --check "$base" "$candidate" -- \
+            src/Storages/ObjectStorage/DataLakes/Iceberg/IcebergMetadata.cpp \
+            src/Storages/ObjectStorage/DataLakes/Iceberg/ManifestFileIterator.cpp \
+            src/Storages/ObjectStorage/DataLakes/Iceberg/ManifestFileIterator.h \
+            tests/integration/helpers/catalog_manager_iceberg_s3.py \
+            tests/integration/helpers/catalog_manager_iceberg_azure.py \
+            tests/integration/test_e2e_iceberg_engine/test.py
+
+          echo "Exactly six expected files. Diff validation passed."
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Compile modified Python files
+        run: |
+          python -m py_compile \
+            tests/integration/helpers/catalog_manager_iceberg_s3.py \
+            tests/integration/helpers/catalog_manager_iceberg_azure.py \
+            tests/integration/test_e2e_iceberg_engine/test.py
+
+      - name: Install pinned Iceberg dependencies
+        run: |
+          python -m pip install --disable-pip-version-check --no-cache-dir \
+            "pyarrow==26.0.1" \
+            "pyiceberg[sql-sqlite]==0.11.1" \
+            "boto3==1.42.61" \
+            "azure-storage-blob==12.27.1"
+
+      - name: Smoke-test S3 and Azure catalog helpers
+        env:
+          PYTHONPATH: tests/integration
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          from tempfile import TemporaryDirectory
+
+          import pyarrow as pa
+          from pyiceberg.catalog.sql import SqlCatalog
+
+          from helpers.catalog_manager_iceberg_s3 import IcebergS3CatalogManager
+          from helpers.catalog_manager_iceberg_azure import IcebergAzureCatalogManager
+
+          def make_batches():
+              batches = []
+              for batch_index in range(4):
+                  ids = list(range(batch_index * 4 + 1, batch_index * 4 + 5))
+                  batches.append(
+                      pa.table(
+                          {
+                              "id": pa.array(ids, type=pa.int64()),
+                              "region": pa.array(["US", "EU", "US", "EU"]),
+                              "value": pa.array(
+                                  [value * 10 for value in ids],
+                                  type=pa.int64(),
+                              ),
+                          }
+                      )
+                  )
+              return batches
+
+          def make_catalog(name, root, warehouse):
+              root.mkdir(parents=True, exist_ok=True)
+              warehouse.mkdir(parents=True, exist_ok=True)
+
+              catalog = SqlCatalog(
+                  name,
+                  uri=f"sqlite:///{root / 'catalog.db'}",
+                  warehouse=warehouse.resolve().as_uri(),
+              )
+              catalog.create_namespace("default")
+              return catalog
+
+          def verify_result(label, catalog, table_name, snapshot_ids, manager):
+              assert len(snapshot_ids) == 4, snapshot_ids
+              assert manager._tables_created == [table_name]
+
+              table = catalog.load_table(f"default.{table_name}")
+              snapshot = table.current_snapshot()
+              assert snapshot is not None
+
+              manifest_count = len(snapshot.manifests(table.io))
+              assert manifest_count >= 2, manifest_count
+
+              print(
+                  f"{label}: {len(snapshot_ids)} snapshots, "
+                  f"{manifest_count} manifests -- PASSED"
+              )
+
+          with TemporaryDirectory(prefix="iceberg-pruner-precheck-") as temporary:
+              root = Path(temporary)
+              batches = make_batches()
+
+              s3_root = root / "s3"
+              s3_catalog = make_catalog(
+                  "e2e_s3",
+                  s3_root,
+                  s3_root / "warehouse",
+              )
+
+              s3_manager = IcebergS3CatalogManager.__new__(IcebergS3CatalogManager)
+              s3_manager._catalog = s3_catalog
+              s3_manager._tables_created = []
+
+              s3_name, s3_snapshots = s3_manager.create_table_multi_snapshot(
+                  batches,
+                  partition_column="region",
+              )
+
+              verify_result(
+                  "S3 local-catalog helper",
+                  s3_catalog,
+                  s3_name,
+                  s3_snapshots,
+                  s3_manager,
+              )
+
+              azure_root = root / "azure"
+              azure_catalog = make_catalog(
+                  "e2e_azure",
+                  azure_root / "catalog",
+                  azure_root,
+              )
+
+              azure_manager = IcebergAzureCatalogManager.__new__(
+                  IcebergAzureCatalogManager
+              )
+              azure_manager._catalog = azure_catalog
+              azure_manager._local_warehouse = str(azure_root)
+              azure_manager._tables_created = []
+              azure_manager._upload_table = lambda _table_name: None
+
+              azure_name, azure_snapshots = (
+                  azure_manager.create_table_multi_snapshot(
+                      batches,
+                      partition_column="region",
+                  )
+              )
+
+              verify_result(
+                  "Azure local-catalog helper",
+                  azure_catalog,
+                  azure_name,
+                  azure_snapshots,
+                  azure_manager,
+              )
+
+          print("Both local catalog-helper smoke tests passed.")
+          PY
