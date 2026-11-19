@@ -28,10 +28,22 @@ jobs:
             /tests/integration/helpers/catalog_manager_iceberg_azure.py
             /tests/integration/test_e2e_iceberg_engine/test.py
 
-      - name: Fetch contribution branch
+      - name: Fetch base and contribution branch
         run: |
-          git fetch --no-tags --depth=2 origin \
+          git fetch --no-tags --depth=1 origin \
+            +refs/heads/master:refs/remotes/origin/master
+          git fetch --no-tags --depth=3 origin \
             +refs/heads/issue-131937-pruner-reuse:refs/remotes/origin/issue-131937-pruner-reuse
+
+          expected_base="50034a4363dc863cc1df8a2039be000f74f62d2c"
+          actual_base="$(git rev-parse origin/master)"
+
+          if [[ "$actual_base" != "$expected_base" ]]; then
+            echo "Fork master differs from the pinned contribution base."
+            echo "Expected: $expected_base"
+            echo "Actual:   $actual_base"
+            exit 1
+          fi
 
       - name: Check out contribution commit
         run: |
@@ -43,7 +55,7 @@ jobs:
           set -euo pipefail
 
           candidate="origin/issue-131937-pruner-reuse"
-          base="$(git rev-parse "${candidate}^")"
+          base="50034a4363dc863cc1df8a2039be000f74f62d2c"
 
           expected="$(printf '%s\n' \
             src/Storages/ObjectStorage/DataLakes/Iceberg/IcebergMetadata.cpp \
@@ -90,7 +102,7 @@ jobs:
           from pathlib import Path
 
           candidate = "origin/issue-131937-pruner-reuse"
-          base = f"{candidate}^"
+          base = "50034a4363dc863cc1df8a2039be000f74f62d2c"
 
           cpp_files = [
               "src/Storages/ObjectStorage/DataLakes/Iceberg/IcebergMetadata.cpp",
@@ -175,9 +187,8 @@ jobs:
           if suggestions:
               print(f"Formatting suggestions written to {patch_path}.")
               print("The patch will be uploaded as a workflow artifact.")
-              sys.exit(1)
-
-          print("All changed C++ regions pass clang-format-20.")
+          else:
+              print("All changed C++ regions pass clang-format-20.")
           PY
 
       - name: Upload formatting suggestions
@@ -328,3 +339,15 @@ jobs:
 
           print("Both local catalog-helper smoke tests passed.")
           PY
+
+      - name: Enforce changed-line C++ formatting
+        if: success()
+        shell: bash
+        run: |
+          if [[ -s clang-format-suggestions.patch ]]; then
+            echo "::error::C++ formatting differences remain."
+            echo "Download the clang-format-suggestions artifact."
+            exit 1
+          fi
+
+          echo "Changed C++ regions pass clang-format-20."
